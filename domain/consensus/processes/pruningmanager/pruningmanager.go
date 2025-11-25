@@ -935,10 +935,10 @@ func (pm *pruningManager) calculateDiffBetweenPreviousAndCurrentPruningPoints(st
 			return pm.calculateDiffUsingFullUTXOSets(stagingArea, previousPruningHash, currentPruningHash)
 		}
 
-		// Log progress periodically
+		// Log progress periodically (lengths are cheap O(1) operations on slices)
 		if totalChainLength > 0 && totalChainLength%1000 == 0 {
-			log.Debugf("Traversing diff chain: %d hashes from previous, %d hashes from current (total: %d)",
-				len(diffHashesFromPrevious), len(diffHashesFromCurrent), totalChainLength)
+			log.Debugf("Traversing diff chain: total %d hashes (%d from previous, %d from current)",
+				totalChainLength, len(diffHashesFromPrevious), len(diffHashesFromCurrent))
 		}
 
 		// if currentPruningCurrentDiffChildBlueWork > previousPruningCurrentDiffChildBlueWork
