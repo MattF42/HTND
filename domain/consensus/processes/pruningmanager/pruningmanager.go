@@ -17,6 +17,11 @@ import (
 	"github.com/pkg/errors"
 )
 
+// maxDiffChainLength is the threshold for diff chain length beyond which
+// we fall back to rebuilding full UTXO sets instead of traversing the diff chain.
+// This prevents the 4 minute stall that can occur with very long diff chains.
+const maxDiffChainLength = 10000
+
 // pruningManager resolves and manages the current pruning point
 type pruningManager struct {
 	databaseContext model.DBManager
@@ -778,6 +783,88 @@ func (pm *pruningManager) validateUTXOSetFitsCommitment(stagingArea *model.Stagi
 	return nil
 }
 
+// rebuildFullUTXOSet rebuilds the full UTXO set for a given block by iterating
+// through its past UTXO set iterator and collecting all entries into a map.
+func (pm *pruningManager) rebuildFullUTXOSet(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash) (map[externalapi.DomainOutpoint]externalapi.UTXOEntry, error) {
+	log.Debugf("Rebuilding full UTXO set for block %s", blockHash)
+	iter, err := pm.consensusStateManager.RestorePastUTXOSetIterator(stagingArea, blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	set := make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)
+	count := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		outpoint, entry, err := iter.Get()
+		if err != nil {
+			return nil, err
+		}
+		set[*outpoint] = entry
+		count++
+		if count%100000 == 0 {
+			log.Debugf("Rebuilt %d UTXO entries so far for block %s", count, blockHash)
+		}
+	}
+	log.Debugf("Finished rebuilding full UTXO set for block %s with %d entries", blockHash, count)
+	return set, nil
+}
+
+// diffFullUTXOSets computes the UTXO diff between two full UTXO sets.
+// The result represents changes needed to go from previousSet to currentSet.
+func (pm *pruningManager) diffFullUTXOSets(previousSet, currentSet map[externalapi.DomainOutpoint]externalapi.UTXOEntry) (externalapi.UTXODiff, error) {
+	log.Debugf("Diffing full UTXO sets: previous has %d entries, current has %d entries", len(previousSet), len(currentSet))
+
+	// toAdd contains entries in currentSet but not in previousSet (or with different values)
+	toAdd := make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)
+	// toRemove contains entries in previousSet but not in currentSet (or with different values)
+	toRemove := make(map[externalapi.DomainOutpoint]externalapi.UTXOEntry)
+
+	// Find entries to add (in current but not in previous, or different)
+	for outpoint, currentEntry := range currentSet {
+		previousEntry, exists := previousSet[outpoint]
+		if !exists {
+			toAdd[outpoint] = currentEntry
+		} else if previousEntry.BlockDAAScore() != currentEntry.BlockDAAScore() {
+			// Entry exists in both but with different DAA score - treat as remove old, add new
+			toRemove[outpoint] = previousEntry
+			toAdd[outpoint] = currentEntry
+		}
+		// If exists with same DAA score, no change needed
+	}
+
+	// Find entries to remove (in previous but not in current)
+	for outpoint, previousEntry := range previousSet {
+		if _, exists := currentSet[outpoint]; !exists {
+			toRemove[outpoint] = previousEntry
+		}
+	}
+
+	log.Debugf("Full UTXO set diff computed: %d entries to add, %d entries to remove", len(toAdd), len(toRemove))
+	return utxo.NewUTXODiffFromCollections(utxo.NewUTXOCollection(toAdd), utxo.NewUTXOCollection(toRemove))
+}
+
+// calculateDiffUsingFullUTXOSets computes the diff between previous and current pruning points
+// by rebuilding their full UTXO sets and then diffing them. This is used as a fallback
+// when the diff chain is too long.
+func (pm *pruningManager) calculateDiffUsingFullUTXOSets(stagingArea *model.StagingArea, previousPruningHash, currentPruningHash *externalapi.DomainHash) (externalapi.UTXODiff, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "pruningManager.calculateDiffUsingFullUTXOSets")
+	defer onEnd()
+
+	log.Infof("Using full UTXO set rebuild fallback for diff calculation between %s and %s", previousPruningHash, currentPruningHash)
+
+	previousSet, err := pm.rebuildFullUTXOSet(stagingArea, previousPruningHash)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to rebuild UTXO set for previous pruning point %s", previousPruningHash)
+	}
+
+	currentSet, err := pm.rebuildFullUTXOSet(stagingArea, currentPruningHash)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to rebuild UTXO set for current pruning point %s", currentPruningHash)
+	}
+
+	return pm.diffFullUTXOSets(previousSet, currentSet)
+}
+
 // This function takes 2 points (currentPruningHash, previousPruningHash) and traverses the UTXO diff children DAG
 // until it finds a common descendant, at the worse case this descendant will be the current SelectedTip.
 // it then creates 2 diffs, one from that descendant to previousPruningHash and another from that descendant to currentPruningHash
@@ -838,7 +925,22 @@ func (pm *pruningManager) calculateDiffBetweenPreviousAndCurrentPruningPoints(st
 
 	var diffHashesFromPrevious []*externalapi.DomainHash
 	var diffHashesFromCurrent []*externalapi.DomainHash
+	totalChainLength := 0
 	for {
+		// Check if diff chain is too long - fall back to full UTXO set rebuild
+		totalChainLength = len(diffHashesFromPrevious) + len(diffHashesFromCurrent)
+		if totalChainLength >= maxDiffChainLength {
+			log.Infof("Diff chain length (%d) exceeds threshold (%d), falling back to full UTXO set rebuild",
+				totalChainLength, maxDiffChainLength)
+			return pm.calculateDiffUsingFullUTXOSets(stagingArea, previousPruningHash, currentPruningHash)
+		}
+
+		// Log progress periodically (lengths are cheap O(1) operations on slices)
+		if totalChainLength > 0 && totalChainLength%1000 == 0 {
+			log.Debugf("Traversing diff chain: total %d hashes (%d from previous, %d from current)",
+				totalChainLength, len(diffHashesFromPrevious), len(diffHashesFromCurrent))
+		}
+
 		// if currentPruningCurrentDiffChildBlueWork > previousPruningCurrentDiffChildBlueWork
 		if currentPruningCurrentDiffChildBlueWork.Cmp(previousPruningCurrentDiffChildBlueWork) == 1 {
 			diffHashesFromPrevious = append(diffHashesFromPrevious, previousPruningCurrentDiffChild)
@@ -866,6 +968,9 @@ func (pm *pruningManager) calculateDiffBetweenPreviousAndCurrentPruningPoints(st
 			currentPruningCurrentDiffChildBlueWork = diffChildGhostDag.BlueWork()
 		}
 	}
+
+	log.Debugf("Completed diff chain traversal: %d hashes from previous, %d hashes from current",
+		len(diffHashesFromPrevious), len(diffHashesFromCurrent))
 	// The order in which we apply the diffs should be from top to bottom, but we traversed from bottom to top
 	// so we apply the diffs in reverse order.
 	oldDiff := utxo.NewMutableUTXODiff()
